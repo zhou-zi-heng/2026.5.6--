@@ -497,13 +497,13 @@ const API = (function () {
 
 
         const HEARTBEAT_INTERVAL = 5000;
-        const STALL_TIMEOUT = 60000;
+        const STALL_TIMEOUT = 300000;
         const heartbeat = setInterval(() => {
             if (aborted) return;
             if (Date.now() - lastChunkTime > STALL_TIMEOUT) {
                 aborted = true; clearInterval(heartbeat);
                 try { ctrl.abort(); } catch (e) {}
-                if (h.onError) h.onError(new Error('网络无响应超过 60 秒，已自动中断'));
+                if (h.onError) h.onError(new Error('网络无响应超过 300 秒，已自动中断'));
             }
         }, HEARTBEAT_INTERVAL);
 
