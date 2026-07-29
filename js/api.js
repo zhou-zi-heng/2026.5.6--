@@ -361,19 +361,24 @@ const API = (function () {
             return { ok: false, msg: '❌ ' + e.message };
         }
     }
-    /* ============ 图片生成 / 改图（统一入口） ============ */
+    /* ============ 图片生成 / 改图（统一入口 · 修复版） ============ */
     /* options:
-         size: '1024x1024' 等
+         size: '1024x1024' | '' （空=用平台默认，最兼容）
          n: 生成张数
+         quality: '' | 'high' | 'low' | 'hd' | 'standard'
+         output_format: '' | 'png' | 'webp' | 'jpeg'  （空=不传）
          images: base64 dataURL 数组（有内容=改图走 FormData，空=文生图走 JSON）
-       handlers: { onStart, onImage(dataUrlArr), onError } */
+       handlers: { onStart, onImage(dataUrlArr), onError, onAbort } */
     function generateImage(profile, prompt, options, handlers) {
         const opts = options || {};
         const h = handlers || {};
         const key = getKeys(profile)[0];
         const hasRefImages = Array.isArray(opts.images) && opts.images.length > 0;
 
-        // dataURL -> Blob（用于改图的 FormData）
+        // ★ 修复3：真正可中断
+        const ctrl = new AbortController();
+        let aborted = false;
+
         function dataUrlToBlob(dataUrl) {
             const m = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/);
             if (!m) return null;
@@ -384,106 +389,170 @@ const API = (function () {
             return new Blob([bytes], { type: mime });
         }
 
-        // 从返回结果里提取图片，统一成 dataURL 数组
+        /* ★ 修复5：增强兼容，覆盖各平台返回格式 */
         async function extractImages(data) {
-            const arr = (data && data.data) ? data.data : [];
             const out = [];
-            for (const item of arr) {
-                if (item.b64_json) {
-                    out.push('data:image/png;base64,' + item.b64_json);
-                } else if (item.url) {
-                    // 有的平台返 url，转成 base64 存下来防失效
-                    try {
-                        const resp = await fetch(item.url);
-                        const blob = await resp.blob();
-                        const dataUrl = await new Promise((resolve, reject) => {
-                            const r = new FileReader();
-                            r.onload = () => resolve(r.result);
-                            r.onerror = reject;
-                            r.readAsDataURL(blob);
-                        });
-                        out.push(dataUrl);
-                    } catch (e) {
-                        out.push(item.url); // 转失败就直接用 url
-                    }
-                }
+            const pushB64 = (b64, mime) => {
+                if (!b64) return;
+                out.push('data:' + (mime || 'image/png') + ';base64,' + b64);
+            };
+            const pushUrl = (u) => { if (u) out.push(u); };
+
+            // ① OpenAI 标准： { data:[{b64_json|url}] }
+            if (data && Array.isArray(data.data)) {
+                data.data.forEach(it => {
+                    if (it.b64_json) pushB64(it.b64_json, it.mime_type);
+                    else if (it.url) pushUrl(it.url);
+                    else if (it.image) pushB64(it.image);
+                    else if (it.b64) pushB64(it.b64);
+                });
+            }
+            // ② { images:[url|b64|{url}] }
+            if (!out.length && data && Array.isArray(data.images)) {
+                data.images.forEach(it => {
+                    if (typeof it === 'string') {
+                        if (/^https?:\/\//.test(it)) pushUrl(it);
+                        else if (/^data:image/.test(it)) out.push(it);
+                        else pushB64(it);
+                    } else if (it && it.url) pushUrl(it.url);
+                    else if (it && it.b64_json) pushB64(it.b64_json);
+                });
+            }
+            // ③ { output:[url] } / { artifacts:[{base64}] } / { result:{images:[]} }
+            if (!out.length && data && Array.isArray(data.output)) {
+                data.output.forEach(u => typeof u === 'string' ? pushUrl(u) : null);
+            }
+            if (!out.length && data && Array.isArray(data.artifacts)) {
+                data.artifacts.forEach(a => pushB64(a.base64));
+            }
+            if (!out.length && data && data.result && Array.isArray(data.result.images)) {
+                data.result.images.forEach(u => typeof u === 'string' ? pushUrl(u) : null);
+            }
+            // ④ Gemini 风格 candidates → inlineData
+            if (!out.length && data && Array.isArray(data.candidates)) {
+                data.candidates.forEach(c => {
+                    const parts = (c.content && c.content.parts) || [];
+                    parts.forEach(p => {
+                        if (p.inlineData && p.inlineData.data) pushB64(p.inlineData.data, p.inlineData.mimeType);
+                    });
+                });
             }
             return out;
+        }
+
+        /* 判断错误是否为"参数不被支持"，用于降级重试 */
+        function isParamError(errText) {
+            const s = String(errText || '').toLowerCase();
+            return /unsupported|not support|unknown parameter|unrecognized|invalid.*(size|quality|format|response_format|n)|extra fields|unexpected/.test(s);
+        }
+
+        /* 发一次请求；minimal=true 表示只带 model+prompt（最兼容降级模式） */
+        async function doRequest(minimal) {
+            if (hasRefImages) {
+                // ===== 改图：multipart/form-data → /images/edits =====
+                const fd = new FormData();
+                fd.append('model', profile.model);
+                fd.append('prompt', prompt);
+                if (!minimal) {
+                    if (opts.size) fd.append('size', opts.size);
+                    if (opts.n) fd.append('n', String(opts.n));
+                    if (opts.quality) fd.append('quality', opts.quality);
+                    if (opts.output_format) fd.append('output_format', opts.output_format);
+                }
+                opts.images.forEach((durl, i) => {
+                    const blob = dataUrlToBlob(durl);
+                    if (blob) {
+                        const ext = (blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+                        fd.append('image[]', blob, 'ref' + i + '.' + ext);
+                    }
+                });
+
+                const headers = {};
+                if (profile.origin === 'public') {
+                    headers['X-Engine-Id'] = profile.id;
+                } else {
+                    headers['X-Target-Base'] = profile.base || '';
+                    headers['Authorization'] = 'Bearer ' + (key || '');
+                }
+                if (typeof Auth !== 'undefined' && Auth.getToken()) {
+                    headers['X-Auth-Token'] = Auth.getToken();
+                }
+                return fetch('/api/images/edits', {
+                    method: 'POST', headers: headers, body: fd, signal: ctrl.signal,
+                });
+            }
+
+            // ===== 文生图：JSON → /images/generations =====
+            const payload = { model: profile.model, prompt: prompt };
+            if (!minimal) {
+                if (opts.n) payload.n = opts.n;
+                if (opts.size) payload.size = opts.size;
+                if (opts.quality) payload.quality = opts.quality;
+                if (opts.output_format) payload.output_format = opts.output_format;
+            }
+            return apiF(profile, 'images/generations', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+                signal: ctrl.signal,
+            }, key);
         }
 
         (async () => {
             try {
                 if (h.onStart) h.onStart();
 
-                let resp;
+                let resp = await doRequest(false);
 
-                if (hasRefImages) {
-                    // ===== 改图：multipart/form-data → /images/edits =====
-                    const fd = new FormData();
-                    fd.append('model', profile.model);
-                    fd.append('prompt', prompt);
-                    if (opts.size) fd.append('size', opts.size);
-                    if (opts.n) fd.append('n', String(opts.n));
-                    if (opts.quality) fd.append('quality', opts.quality);
-                    if (opts.output_format) fd.append('output_format', opts.output_format);
-
-                    opts.images.forEach((durl, i) => {
-                        const blob = dataUrlToBlob(durl);
-                        if (blob) {
-                            const ext = (blob.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
-                            fd.append('image[]', blob, 'ref' + i + '.' + ext);
-                        }
-                    });
-
-                    // FormData 不能手动设 Content-Type，让浏览器自动带 boundary
-                    const headers = {};
-                    if (profile.origin === 'public') {
-                        headers['X-Engine-Id'] = profile.id;
-                    } else {
-                        headers['X-Target-Base'] = profile.base || '';
-                        headers['Authorization'] = 'Bearer ' + (key || '');
-                    }
-                    if (typeof Auth !== 'undefined' && Auth.getToken()) {
-                        headers['X-Auth-Token'] = Auth.getToken();
-                    }
-
-                    resp = await fetch('/api/images/edits', {
-                        method: 'POST',
-                        headers: headers,
-                        body: fd,
-                    });
-                } else {
-                    // ===== 文生图：JSON → /images/generations =====
-                    const payload = { model: profile.model, prompt: prompt };
-                    if (opts.n) payload.n = opts.n;
-                    if (opts.size) payload.size = opts.size;
-                    if (opts.quality) payload.quality = opts.quality;
-                    if (opts.output_format) payload.output_format = opts.output_format;
-
-                    resp = await apiF(profile, 'images/generations', {
-                        method: 'POST',
-                        body: JSON.stringify(payload),
-                    }, key);
-                }
-
+                // ★ 修复1+2：参数被拒 → 自动去掉所有可选参数重试一次
                 if (!resp.ok) {
                     const errText = await resp.text();
-                    throw new Error('HTTP ' + resp.status + ': ' + errText.slice(0, 300));
+                    if ((resp.status === 400 || resp.status === 422) && isParamError(errText)) {
+                        console.warn('[generateImage] 参数被拒，降级重试：', errText.slice(0, 200));
+                        resp = await doRequest(true);
+                        if (!resp.ok) {
+                            const e2 = await resp.text();
+                            throw new Error('HTTP ' + resp.status + '（已降级重试仍失败）: ' + e2.slice(0, 400));
+                        }
+                    } else {
+                        throw new Error('HTTP ' + resp.status + ': ' + errText.slice(0, 400));
+                    }
                 }
 
-                const data = await resp.json();
-                const images = await extractImages(data);
+                const raw = await resp.text();
+                let data;
+                try { data = JSON.parse(raw); }
+                catch (e) { throw new Error('返回非JSON：' + raw.slice(0, 300)); }
 
-                if (!images.length) throw new Error('平台未返回图片（检查模型是否支持出图）');
+                if (data && data.error) {
+                    const em = (typeof data.error === 'string') ? data.error : (data.error.message || JSON.stringify(data.error));
+                    throw new Error('平台报错：' + String(em).slice(0, 400));
+                }
+
+                const images = await extractImages(data);
+                if (!images.length) {
+                    throw new Error('平台未返回图片。原始返回：' + raw.slice(0, 300));
+                }
+                if (aborted) { if (h.onAbort) h.onAbort(); return; }
                 if (h.onImage) h.onImage(images);
             } catch (err) {
+                if (err && (err.name === 'AbortError' || aborted)) {
+                    if (h.onAbort) h.onAbort();
+                    return;
+                }
                 if (h.onError) h.onError(err);
             }
         })();
 
-        // 生图是非流式，返回一个假的 abort（保持和 streamChat 接口一致）
-        return { abort: function () {}, get full() { return ''; } };
+        // ★ 修复3：返回真正可用的 abort
+        return {
+            abort: function () {
+                aborted = true;
+                try { ctrl.abort(); } catch (e) {}
+            },
+            get full() { return ''; }
+        };
     }
+
 
 
     /* ============ 核心：流式对话 ============ */
