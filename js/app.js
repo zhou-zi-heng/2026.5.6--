@@ -731,7 +731,20 @@ async function doNetworkAugment(userText, onProgress) {
 
 
 async function send() {
-    if (_streamCtrl) { _streamCtrl.abort(); return; }
+    if (_streamCtrl) {
+        try { _streamCtrl.abort(); } catch (e) {}
+        // ★ 防卡死兜底：abort 后强制解锁按钮，避免永久发不出消息
+        setTimeout(() => {
+            if (_streamCtrl) {
+                _streamCtrl = null;
+                const sb = document.getElementById('sendBtn');
+                if (sb) { sb.classList.remove('stop'); sb.textContent = '➤'; }
+                toast('已强制解锁，可重新发送');
+            }
+        }, 1200);
+        return;
+    }
+
 
     const inp = document.getElementById('uIn');
     const text = (inp.value || '').trim();
@@ -787,12 +800,13 @@ async function coreSendImage(prompt) {
 
     const profile = effectiveProfile();
     if (!profile) { toast('无可用引擎', 'er'); return; }
+    if (!profile.model) { toast('该引擎未设置模型，请到 ⚙️ 填写生图模型名', 'er'); openM('set'); return; }
 
-    // ===== 从描述词自动解析生图参数（比例 / 画质 / 格式）=====
+    // ===== 从描述词解析生图参数（★修复1+2：默认全部不传，最大兼容）=====
     const lower = (prompt || '').toLowerCase();
 
-    // 比例 → size（gpt-image 支持：1024x1024 / 1536x1024 / 1024x1536）
-    let size = '1536x1024'; // 默认横图
+    // 比例 → size（用户没说比例就不传，让平台用默认值）
+    let size = '';
     if (/(9\s*[:：]\s*16)|竖屏|竖向|竖图|竖版|portrait/.test(lower)) {
         size = '1024x1536';
     } else if (/(1\s*[:：]\s*1)|方形|方图|正方|square/.test(lower)) {
@@ -801,38 +815,46 @@ async function coreSendImage(prompt) {
         size = '1536x1024';
     }
 
-    // 画质 → quality（不写则不传，用平台默认）
+    // 画质（用户没说就不传）
     let quality = '';
-    if (/高清|精细|超清|hd|high/.test(lower)) {
-        quality = 'high';
-    } else if (/草图|低质|快速|low/.test(lower)) {
-        quality = 'low';
-    }
+    if (/高清|精细|超清|\bhd\b|high/.test(lower)) quality = 'high';
+    else if (/草图|低质|快速|\blow\b/.test(lower)) quality = 'low';
 
-    // 格式 → output_format（默认 png）
-    let outFormat = 'png';
-    if (/webp/.test(lower)) {
-        outFormat = 'webp';
-    } else if (/jpe?g/.test(lower)) {
-        outFormat = 'jpeg';
-    }
+    // 格式（★修复1：默认不传！只有用户明确要 webp/jpg 才传）
+    let outFormat = '';
+    if (/webp/.test(lower)) outFormat = 'webp';
+    else if (/jpe?g/.test(lower)) outFormat = 'jpeg';
 
-    // 收集参考图：参考框里勾选的图片 + 本轮上传的图片（有图=改图，无图=文生图）
+    // ===== 收集参考图（★修复4：参考框 + 待发附件 + 知识库，三处都收）=====
     const refImgs = [];
+    const refNames = [];
     sortedRefPool().forEach(r => {
-        if (r.checked && r.kind === 'file' && r.type === 'image' && r.dataUrl) refImgs.push(r.dataUrl);
+        if (r.checked && r.kind === 'file' && r.type === 'image' && r.dataUrl) {
+            refImgs.push(r.dataUrl); refNames.push(r.name || '参考图');
+        }
     });
     _pendingAtts.forEach(a => {
-        if (a.type === 'image' && a.dataUrl) refImgs.push(a.dataUrl);
+        if (a.type === 'image' && a.dataUrl) {
+            refImgs.push(a.dataUrl); refNames.push(a.fileName || '上传图');
+        }
     });
+    if (c.knowledgeBase && c.knowledgeBase.length) {
+        c.knowledgeBase.forEach(k => {
+            if (k.type === 'image' && k.dataUrl) {
+                refImgs.push(k.dataUrl); refNames.push(k.name || '知识库图');
+            }
+        });
+    }
 
     const isEdit = refImgs.length > 0;
+    // ★修复4：明确提示用户带了几张参考图
+    if (isEdit) toast('🖼️ 已带 ' + refImgs.length + ' 张参考图进行改图');
 
     // 落消息
     const userMsg = {
         id: gId(),
         role: 'user',
-        content: prompt + (isEdit ? '（参考 ' + refImgs.length + ' 张图改图）' : ''),
+        content: prompt + (isEdit ? '\n\n🖼️ 参考图（' + refImgs.length + ' 张）：' + refNames.join('、') : ''),
         _actual: prompt,
         _time: nowTime()
     };
@@ -841,10 +863,13 @@ async function coreSendImage(prompt) {
     const aiMsg = {
         id: gId(),
         role: 'assistant',
-        content: isEdit ? '🎨 正在参考图片生成...' : '🎨 正在生成图片...',
+        content: isEdit
+            ? '🎨 正在参考 ' + refImgs.length + ' 张图片改图...'
+            : '🎨 正在生成图片...',
         _streaming: true,
         _time: nowTime(),
         _engId: S.currentEngId,
+        _model: profile.model,      // ★修复6
         _isImage: true
     };
     c.messages.push(aiMsg);
@@ -865,7 +890,7 @@ async function coreSendImage(prompt) {
     renderSB();
     await saveNow();
 
-    // 本轮上传的图已经用过了，清空待发附件
+    // 本轮上传的图已用过，清空待发附件（参考框保留）
     _pendingAtts = [];
     renderAttList();
     if (typeof renderWfAtts === 'function') renderWfAtts();
@@ -877,14 +902,17 @@ async function coreSendImage(prompt) {
     const area = document.getElementById('msgsArea');
     const lastMsgEl = area.querySelector('.msg:last-child .bub');
 
-    // 组装生图参数
-    const genOpts = {
-        size: size,
-        n: 1,
-        images: refImgs,
-        output_format: outFormat,
-    };
+    // ★修复1+2：只传"用户明确要求"的参数，其余交给平台默认
+    const genOpts = { n: 1, images: refImgs };
+    if (size) genOpts.size = size;
     if (quality) genOpts.quality = quality;
+    if (outFormat) genOpts.output_format = outFormat;
+
+    const finish = () => {
+        _streamCtrl = null;
+        sendBtn.classList.remove('stop');
+        sendBtn.textContent = '➤';
+    };
 
     _streamCtrl = API.generateImage(profile, prompt, genOpts, {
         onStart: () => {},
@@ -893,28 +921,40 @@ async function coreSendImage(prompt) {
             aiMsg.content = md;
             aiMsg._streaming = false;
             c.updatedAt = Date.now();
-            _streamCtrl = null;
-            sendBtn.classList.remove('stop');
-            sendBtn.textContent = '➤';
+            finish();
             if (lastMsgEl) UI.fullRender(lastMsgEl, md);
-            await saveNow();
+            try { await saveNow(); }
+            catch (e) { toast('图片已显示，但保存失败（图片体积大）', 'er'); }
             renderMs();
             renderSB();
             if (typeof Archive !== 'undefined') Archive.notifyActivity();
         },
-        onError: async (err) => {
-            aiMsg.content = '❌ 生图失败：' + err.message;
+        onAbort: async () => {
+            aiMsg.content = '⏹ 已取消生图';
             aiMsg._streaming = false;
             aiMsg._interrupted = true;
-            _streamCtrl = null;
-            sendBtn.classList.remove('stop');
-            sendBtn.textContent = '➤';
+            finish();
             if (lastMsgEl) UI.fullRender(lastMsgEl, aiMsg.content);
             await saveNow();
-            toast('生图失败：' + err.message, 'er');
+            renderMs();
+            toast('已取消');
+        },
+        onError: async (err) => {
+            aiMsg.content = '❌ 生图失败：' + err.message
+                + '\n\n**排查提示**：\n'
+                + '- 模型名是否正确（当前：`' + (profile.model || '空') + '`）\n'
+                + '- 该模型是否支持出图 / 是否支持改图接口 `/images/edits`\n'
+                + '- 中转站是否开通了图像接口权限';
+            aiMsg._streaming = false;
+            aiMsg._interrupted = true;
+            finish();
+            if (lastMsgEl) UI.fullRender(lastMsgEl, aiMsg.content);
+            await saveNow();
+            toast('生图失败：' + err.message.slice(0, 60), 'er');
         },
     });
 }
+
 
 
 async function regenerate(msg){const c=curChat();if(!c)return;const idx=c.messages.indexOf(msg);if(idx<1)return;const prev=c.messages[idx-1];if(prev.role!=='user'){toast('无法找到对应的提问','er');return;}const actual=prev._actual||(typeof prev.content==='string'?prev.content:'');const visible=typeof prev.content==='string'?prev.content:'';c.messages.splice(idx,1);c.messages.splice(idx-1,1);await saveNow();renderMs();await coreSend({visibleText:visible,actualText:actual,titleHint:visible});}
